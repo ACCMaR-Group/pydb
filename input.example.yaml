@@ -1,0 +1,38 @@
+# Safe example: fill in corpus_root and configure a trusted embedding endpoint before enabling.
+# Recipe-relative corpus_root/output_dir paths resolve from this file's directory.
+corpus_root: /home/gweng/WoS/Corpus/AI4PSC/papers
+# paper_ids: [paper1, paper22] # omit to select all paper<number> directories
+output_dir: ./builds
+alias: science
+max_quarantined_papers: 0
+embedding:
+  enabled: false
+  # Use HTTPS for remote services; loopback HTTP is permitted for local test servers.
+  base_url: http://127.0.0.1:8000/v1
+  model: configured-model
+  # Preferred: export SCIENCE_EMBEDDING_API_KEY in the build/query process environment.
+  api_key: ${SCIENCE_EMBEDDING_API_KEY}
+  # Alternatively use `api_key_env: SCIENCE_EMBEDDING_API_KEY` (not both).
+  # A literal `api_key: ...` is accepted but is less safe and must not be committed.
+  batch_size: 64
+  timeout: 30
+  retries: 2
+  document_prefix: ""
+  query_prefix: ""
+  # Optional maximum cosine distance. This 0.5 example is only a heuristic, not a guarantee;
+  # tune against labeled retrieval evaluation for the configured provider/model. Omit or use null to disable.
+  max_distance: 0.5
+  # dimensions: 1024
+chroma:
+  enabled: false
+# To use Chroma, install the `chroma` extra, then set embedding.enabled and chroma.enabled true.
+# Example manual workflow after creating/activating a configured recipe:
+#   python -m pydb plan input.yaml
+#   python -m pydb build input.yaml
+#   python -m pydb validate builds/<BUILD_ID>
+#   python -m pydb publish builds/<BUILD_ID> --sciturbo-root /home/gweng/codes/ai4s/sciturbo
+#   # Publishing is explicit promotion only; review the target config home before use.
+# For sciturbo hybrid retrieval, use absolute paths and the installed pydb interpreter:
+#   export SCITURBO_PYDB_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+#   export SCITURBO_PYDB_RECIPE="/absolute/path/to/input.yaml"
+# Keep that recipe and its exported SCIENCE_EMBEDDING_API_KEY available to the search process.

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pydb-science"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6,<7"]
+
+[project.scripts]
+pydb = "pydb.cli:main"
+
+[project.optional-dependencies]
+chroma = ["chromadb==1.5.9"]
+test = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
