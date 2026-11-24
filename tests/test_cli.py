@@ -32,6 +32,28 @@ def test_plan_reports_chroma_dependency_without_importing_it(tmp_path, capsys, m
     assert not (tmp_path / "out").exists()
 
 
+def test_plan_reports_memory_and_chunking_without_writing(tmp_path, capsys):
+    paper = tmp_path / "paper1"
+    (paper / "knowledge").mkdir(parents=True)
+    (paper / "main.tex").write_text("\\section{Results} First sentence. Second sentence.", encoding="utf-8")
+    (paper / "knowledge" / "sections.json").write_text(json.dumps({"sections": [
+        {"id": "results", "title": "Results", "page_range": {"start": 1, "end": 1}}
+    ]}), encoding="utf-8")
+    recipe = tmp_path / "input.yaml"
+    recipe.write_text(
+        f"corpus_root: {tmp_path}\noutput_dir: {tmp_path / 'out'}\n"
+        "embedding:\n  enabled: true\n  base_url: https://api.example/v1\n  model: demo\n  expected_dimensions: 4096\n"
+        "chunking:\n  mode: passage\n")
+    assert main(["plan", str(recipe)]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["planning"]["chunking"]["mode"] == "passage"
+    assert plan["planning"]["memory"]["dimensions"] == 4096
+    assert plan["planning"]["memory"]["estimate"] == "sampled-v1"
+    assert plan["planning"]["memory"]["sampledPapers"] == 1
+    assert "recommendation" in plan["planning"]
+    assert not (tmp_path / "out").exists()
+
+
 def test_plan_fails_for_empty_corpus_without_writing(tmp_path, capsys):
     recipe = tmp_path / "input.yaml"
     recipe.write_text(f"corpus_root: {tmp_path}\noutput_dir: {tmp_path / 'out'}\n")

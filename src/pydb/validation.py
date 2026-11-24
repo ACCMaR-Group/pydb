@@ -4,7 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .evidence import sha256
+from .evidence import EXTRACTOR_VERSION, NORMALIZER_VERSION, sha256
 
 
 def _utf16_slice(value: str, start: int, end: int) -> str:
@@ -43,7 +43,7 @@ def validate_build(build_path: str | Path, required_queries: list[dict] | None =
         if not run or meta.get("build_id") != run[0]: errors.append("manifest_identity_mismatch")
         if manifest is None:
             manifest = meta.get("build_report")
-        if run and (run[2] != "bundle-v4" or run[3] != "latex-v3"): errors.append("version_mismatch")
+        if run and (run[2] != EXTRACTOR_VERSION or run[3] != NORMALIZER_VERSION): errors.append("version_mismatch")
         checked = 0
         if db.execute("SELECT COUNT(*) FROM papers p LEFT JOIN source_texts s ON s.paper_id=p.id WHERE s.paper_id IS NULL").fetchone()[0]: errors.append("source_text_missing")
         for paper_id, original, normalized, maps, source_hash, normalized_hash in db.execute("SELECT paper_id,original_text,normalized_text,offset_map,source_hash,normalized_hash FROM source_texts"):

@@ -25,7 +25,7 @@ def embed_texts(config: EmbeddingConfig, texts: list[str]) -> list[list[float]]:
         return []
     key = resolve_api_key(config)
     result: list[list[float] | None] = [None] * len(texts)
-    expected_dimensions = config.dimensions
+    expected_dimensions = config.expected_dim()
     for start in range(0, len(texts), config.batch_size):
         batch = texts[start:start + config.batch_size]
         payload = {"model": config.model, "input": batch, "encoding_format": "float"}

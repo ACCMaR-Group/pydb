@@ -5,6 +5,17 @@ corpus_root: /home/gweng/WoS/Corpus/AI4PSC/papers
 output_dir: ./builds
 alias: science
 max_quarantined_papers: 0
+# Evidence/vector granularity. Finer units improve citation precision but need
+# more vector memory. "sentence" disables merging; "passage" merges adjacent
+# sentence spans in a section up to target_chars UTF-16 units; "coarse" defaults
+# to 2400; "custom" requires target_chars and max_gap; "auto" is resolved by
+# `python -m pydb plan` (build rejects it until explicit values are set).
+chunking:
+  mode: passage
+  target_chars: 1200
+  max_gap: 100
+# Explicit override for the plan-style memory gate. Prefer a coarser mode.
+allow_over_budget: false
 embedding:
   enabled: false
   # Use HTTPS for remote services; loopback HTTP is permitted for local test servers.
@@ -22,7 +33,10 @@ embedding:
   # Optional maximum cosine distance. This 0.5 example is only a heuristic, not a guarantee;
   # tune against labeled retrieval evaluation for the configured provider/model. Omit or use null to disable.
   max_distance: 0.5
-  # dimensions: 1024
+  # dimensions: 1024  # Sent to the server; only for Matryoshka-capable models.
+  # Planning/validation only: asserted vector length, never sent. Required for
+  # a plan-time memory estimate when `dimensions` is omitted.
+  # expected_dimensions: 1024
 chroma:
   enabled: false
 # To use Chroma, install the `chroma` extra, then set embedding.enabled and chroma.enabled true.

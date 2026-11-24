@@ -45,6 +45,44 @@ def test_embedding_only_creates_secret_free_checkpoint(tmp_path, monkeypatch):
     assert validate_vectors(dbpath, tmp_path / "work", metadata)["valid"]
 
 
+def test_embedding_fingerprint_includes_expected_dimensions(tmp_path):
+    from pydb.config import Config
+    def config(dim):
+        return Config(tmp_path, None, tmp_path, "science",
+                      EmbeddingConfig("https://api.example/v1", "mock", expected_dimensions=dim),
+                      False, 0, tmp_path / "input.yaml", "python", [])
+    assert embedding_fingerprint(config(4096)) != embedding_fingerprint(config(1024))
+
+
+def test_chroma_resume_reuses_checkpoint_without_reembedding(tmp_path, monkeypatch):
+    dbpath = tmp_path / "tiny.sqlite"
+    _tiny_db(dbpath)
+    recipe = tmp_path / "input.yaml"
+    recipe.write_text(
+        f"corpus_root: corpus\noutput_dir: {tmp_path}\n"
+        "embedding:\n  enabled: true\n  base_url: https://api.example/v1\n  model: mock\n"
+        "chroma:\n  enabled: true\n"
+    )
+    from pydb.config import load_config
+    config = load_config(recipe)
+    supplied = {"verified material finding": [1.0, 0.0], "generated summary": [0.0, 1.0]}
+    import pydb.vector as vector
+    calls = []
+    def fake(c, texts):
+        calls.append(list(texts))
+        return [supplied[t] for t in texts]
+    monkeypatch.setattr(vector, "embed_texts", fake)
+    metadata = build_vectors(config, dbpath, tmp_path / "build-0123456789ab", "build-0123456789ab")
+    assert len(calls) == 1
+    build_vectors(config, dbpath, tmp_path / "build-0123456789ab", "build-0123456789ab")
+    assert len(calls) == 1
+    index = tmp_path / "build-0123456789ab" / "chroma"
+    client = chromadb.PersistentClient(path=str(index), settings=chromadb.config.Settings(anonymized_telemetry=False))
+    collection = client.get_collection("evidence", embedding_function=None)
+    assert set(collection.get(include=[])["ids"]) == {"stable-id", "summary-id"}
+    assert validate_vectors(dbpath, tmp_path / "build-0123456789ab", metadata)["valid"]
+
+
 def test_real_chroma_index_and_query_use_supplied_vectors(tmp_path, monkeypatch):
     dbpath = tmp_path / "tiny.sqlite"
     _tiny_db(dbpath)

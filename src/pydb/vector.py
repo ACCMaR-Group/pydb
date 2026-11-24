@@ -18,8 +18,8 @@ def embedding_fingerprint(config: Config) -> str:
     if config.embedding is None:
         return ""
     identity = {"base_url": config.embedding.base_url, "model": config.embedding.model,
-                "dimensions": config.embedding.dimensions, "document_prefix": config.embedding.document_prefix,
-                "query_prefix": config.embedding.query_prefix}
+                "dimensions": config.embedding.dimensions, "expected_dimensions": config.embedding.expected_dimensions,
+                "document_prefix": config.embedding.document_prefix, "query_prefix": config.embedding.query_prefix}
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -40,44 +40,14 @@ def build_vectors(config: Config, db_path: str | Path, work_dir: str | Path, bui
     work.mkdir(parents=True, exist_ok=True)
     fingerprint = embedding_fingerprint(config)
     with sqlite3.connect(db_path) as db:
-        rows = db.execute("SELECT id,text,trust_level FROM chunks WHERE trust_level='verified_span' OR (trust_level='generated_summary' AND section='summary') ORDER BY id").fetchall()
+        fetched = db.execute("SELECT id,text,trust_level FROM chunks WHERE trust_level='verified_span' OR (trust_level='generated_summary' AND section='summary') ORDER BY id").fetchall()
+    # Hash once and keep only ids/texts/hashes: vectors are never retained in a
+    # process-wide collection, so memory stays bounded by the batch size.
+    rows = [(chunk_id, text, hashlib.sha256(text.encode()).hexdigest()) for chunk_id, text, _ in fetched]
+    del fetched
+    expected_dimensions = config.embedding.expected_dim()
     checkpoint_path = work / "vectors-checkpoint.sqlite"
-    with sqlite3.connect(checkpoint_path) as checkpoint:
-        checkpoint.execute("CREATE TABLE IF NOT EXISTS vectors (build_id TEXT, fingerprint TEXT, chunk_id TEXT, text_hash TEXT, vector TEXT, PRIMARY KEY(build_id,fingerprint,chunk_id))")
-        identities = [(row[0], hashlib.sha256(row[1].encode()).hexdigest()) for row in rows]
-        pending = []
-        vectors = {}
-        expected_dimensions = config.embedding.dimensions
-        for row, (chunk_id, text_hash) in zip(rows, identities):
-            saved = checkpoint.execute("SELECT text_hash,vector FROM vectors WHERE build_id=? AND fingerprint=? AND chunk_id=?", (build_id, fingerprint, chunk_id)).fetchone()
-            if saved and saved[0] == text_hash:
-                try:
-                    value = json.loads(saved[1])
-                    if expected_dimensions is None and _valid_vector(value, None):
-                        expected_dimensions = len(value)
-                    if _valid_vector(value, expected_dimensions):
-                        vectors[chunk_id] = value
-                        continue
-                except Exception:
-                    pass
-            pending.append((row, text_hash))
-        for start in range(0, len(pending), config.embedding.batch_size):
-            batch = pending[start:start + config.embedding.batch_size]
-            embeddings = embed_texts(config.embedding, [config.embedding.document_prefix + item[0][1] for item in batch])
-            if len(embeddings) != len(batch):
-                raise ValueError("Invalid embedding batch")
-            for (row, text_hash), vector in zip(batch, embeddings):
-                if expected_dimensions is None and _valid_vector(vector, None):
-                    expected_dimensions = len(vector)
-                if not _valid_vector(vector, expected_dimensions):
-                    raise ValueError("Invalid embedding batch")
-                vectors[row[0]] = vector
-                checkpoint.execute("INSERT OR REPLACE INTO vectors VALUES (?,?,?,?,?)", (build_id, fingerprint, row[0], text_hash, json.dumps(vector, separators=(",", ":"))))
-            checkpoint.commit()
-    metadata = {"enabled": False, "embeddingEnabled": True, "protocolVersion": PROTOCOL_VERSION,
-                "buildId": build_id, "embeddingFingerprint": fingerprint,
-                "recipePath": str(config.recipe_path), "pythonExecutable": config.python_executable,
-                "checkpointPath": checkpoint_path.name}
+    collection = None
     if config.chroma:
         try:
             import chromadb
@@ -94,14 +64,53 @@ def build_vectors(config: Config, db_path: str | Path, work_dir: str | Path, bui
             raise
         except Exception:
             collection = client.create_collection("evidence", metadata=expected, embedding_function=None)
-        if rows:
-            ordered = [row[0] for row in rows]
-            max_batch_size = client.get_max_batch_size()
-            row_map = {row[0]: row for row in rows}
-            for start in range(0, len(ordered), max_batch_size):
-                ids = ordered[start:start + max_batch_size]
-                collection.upsert(ids=ids, embeddings=[vectors[cid] for cid in ids],
-                                  documents=[row_map[cid][1] for cid in ids])
+    with sqlite3.connect(checkpoint_path) as checkpoint:
+        checkpoint.execute("CREATE TABLE IF NOT EXISTS vectors (build_id TEXT, fingerprint TEXT, chunk_id TEXT, text_hash TEXT, vector TEXT, PRIMARY KEY(build_id,fingerprint,chunk_id))")
+        saved = {chunk_id: text_hash for chunk_id, text_hash in checkpoint.execute("SELECT chunk_id,text_hash FROM vectors WHERE build_id=? AND fingerprint=?", (build_id, fingerprint))}
+        pending = [(chunk_id, text, text_hash) for chunk_id, text, text_hash in rows if saved.get(chunk_id) != text_hash]
+        batch_ids, batch_vectors, batch_docs = [], [], []
+        def flush():
+            if collection is not None and batch_ids:
+                collection.upsert(ids=list(batch_ids), embeddings=list(batch_vectors), documents=list(batch_docs))
+            batch_ids.clear(); batch_vectors.clear(); batch_docs.clear()
+        def accept(chunk_id, text, vector):
+            nonlocal expected_dimensions
+            if expected_dimensions is None and _valid_vector(vector, None):
+                expected_dimensions = len(vector)
+            if not _valid_vector(vector, expected_dimensions):
+                raise ValueError("Invalid embedding vector")
+            if collection is not None:
+                batch_ids.append(chunk_id); batch_vectors.append(vector); batch_docs.append(text)
+                if len(batch_ids) >= 256: flush()
+        if collection is not None:
+            # Re-upsert persisted vectors so a resumed process repairs any index
+            # writes that were interrupted after their checkpoint commit.
+            for chunk_id, text, text_hash in rows:
+                if saved.get(chunk_id) != text_hash: continue
+                row = checkpoint.execute("SELECT vector FROM vectors WHERE build_id=? AND fingerprint=? AND chunk_id=?", (build_id, fingerprint, chunk_id)).fetchone()
+                try: value = json.loads(row[0]) if row else None
+                except Exception: value = None
+                if not _valid_vector(value, expected_dimensions):
+                    pending.append((chunk_id, text, text_hash))
+                    continue
+                accept(chunk_id, text, value)
+            flush()
+        del saved
+        for start in range(0, len(pending), config.embedding.batch_size):
+            batch = pending[start:start + config.embedding.batch_size]
+            embeddings = embed_texts(config.embedding, [config.embedding.document_prefix + text for _, text, _ in batch])
+            if len(embeddings) != len(batch):
+                raise ValueError("Invalid embedding batch")
+            for (chunk_id, text, text_hash), vector in zip(batch, embeddings):
+                accept(chunk_id, text, vector)
+                checkpoint.execute("INSERT OR REPLACE INTO vectors VALUES (?,?,?,?,?)", (build_id, fingerprint, chunk_id, text_hash, json.dumps(vector, separators=(",", ":"))))
+            checkpoint.commit()
+        flush()
+    metadata = {"enabled": False, "embeddingEnabled": True, "protocolVersion": PROTOCOL_VERSION,
+                "buildId": build_id, "embeddingFingerprint": fingerprint,
+                "recipePath": str(config.recipe_path), "pythonExecutable": config.python_executable,
+                "checkpointPath": checkpoint_path.name}
+    if config.chroma:
         metadata.update({"enabled": True, "indexPath": "chroma", "collection": "evidence"})
     return metadata
 

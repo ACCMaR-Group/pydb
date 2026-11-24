@@ -4,7 +4,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 
-NORMALIZER_VERSION = "latex-v3"
+NORMALIZER_VERSION = "latex-v4"
 EXTRACTOR_VERSION = "bundle-v4"
 
 

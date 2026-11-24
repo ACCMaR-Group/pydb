@@ -55,6 +55,40 @@ def test_build_and_retrieval_validation(tmp_path):
     assert "fts_alignment_mismatch" in validate_build(report["databasePath"])["errors"]
 
 
+def test_adjacent_sentences_merge_into_section_passages(tmp_path):
+    corpus = fixture(tmp_path / "corpus", [("paper1", r"\section{Results} First sentence. Second sentence. Third sentence.", "results", "Results")])
+    report = build(config(corpus, tmp_path / "out"))
+    with sqlite3.connect(report["databasePath"]) as db:
+        rows = db.execute("SELECT text, start_offset, end_offset, trust_level FROM chunks WHERE trust_level='verified_span'").fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "Results First sentence. Second sentence. Third sentence."
+    assert rows[0][3] == "verified_span"
+    checked = validate_build(report["databasePath"])
+    assert checked["valid"] and checked["verifiedSpans"] == 1
+
+
+def test_sentence_mode_keeps_unmerged_evidence(tmp_path):
+    from dataclasses import replace
+    from pydb.config import ChunkingConfig
+    corpus = fixture(tmp_path / "corpus", [("paper1", r"\section{Results} First sentence. Second sentence. Third sentence.", "results", "Results")])
+    cfg = replace(config(corpus, tmp_path / "out"), chunking=ChunkingConfig("sentence"))
+    report = build(cfg)
+    with sqlite3.connect(report["databasePath"]) as db:
+        rows = db.execute("SELECT text FROM chunks WHERE trust_level='verified_span' ORDER BY start_offset").fetchall()
+    assert [row[0] for row in rows] == ["Results First sentence.", "Second sentence.", "Third sentence."]
+    assert validate_build(report["databasePath"])["valid"]
+
+
+def test_auto_chunking_is_rejected_before_writing(tmp_path):
+    from dataclasses import replace
+    from pydb.config import ChunkingConfig
+    corpus = fixture(tmp_path / "corpus", [("paper1", r"\section{Results} Some evidence.", "results", "Results")])
+    cfg = replace(config(corpus, tmp_path / "out"), chunking=ChunkingConfig("auto"))
+    with pytest.raises(ValueError, match="resolved by"):
+        build(cfg)
+    assert not (tmp_path / "out").exists()
+
+
 def test_multisection_pages_and_section_mapping(tmp_path):
     corpus = fixture(tmp_path / "corpus", [("paper1", "\\section{Intro} First text.\\section{Results} Second text.", "intro", "Introduction")])
     sec = corpus / "paper1" / "knowledge" / "sections.json"
@@ -81,14 +115,15 @@ def test_rejected_retrieval_gate_keeps_final_absent(tmp_path):
 
 def test_resume_reuses_completed_ingestion(tmp_path, monkeypatch, capsys):
     import pydb.builder as builder
+    import pydb.segmentation as segmentation
     corpus = fixture(tmp_path / "corpus", [("paper1", r"\section{Results} First evidence.", "results", "Results")])
     cfg = config(corpus, tmp_path / "out")
     calls = []
-    real_normalize = builder.normalize_latex_with_map
+    real_normalize = segmentation.normalize_latex_with_map
     def counting(text):
         calls.append(text)
         return real_normalize(text)
-    monkeypatch.setattr(builder, "normalize_latex_with_map", counting)
+    monkeypatch.setattr(segmentation, "normalize_latex_with_map", counting)
     real_validate = builder.validate_build
     def interrupted(*args, **kwargs):
         raise RuntimeError("simulated interruption after ingestion")
@@ -107,15 +142,16 @@ def test_resume_reuses_completed_ingestion(tmp_path, monkeypatch, capsys):
 
 def test_resume_false_forces_fresh_ingestion(tmp_path, monkeypatch):
     import pydb.builder as builder
+    import pydb.segmentation as segmentation
     from dataclasses import replace
     corpus = fixture(tmp_path / "corpus", [("paper1", r"\section{Results} First evidence.", "results", "Results")])
     cfg = config(corpus, tmp_path / "out")
     calls = []
-    real_normalize = builder.normalize_latex_with_map
+    real_normalize = segmentation.normalize_latex_with_map
     def counting(text):
         calls.append(text)
         return real_normalize(text)
-    monkeypatch.setattr(builder, "normalize_latex_with_map", counting)
+    monkeypatch.setattr(segmentation, "normalize_latex_with_map", counting)
     real_validate = builder.validate_build
     def interrupted(*args, **kwargs):
         raise RuntimeError("simulated interruption after ingestion")

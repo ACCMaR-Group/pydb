@@ -10,7 +10,9 @@ import time
 from pathlib import Path
 
 from .config import Config
-from .evidence import EXTRACTOR_VERSION, NORMALIZER_VERSION, normalize_latex, normalize_latex_with_map, segment_source_text, sha256
+from .estimation import check_build_fit
+from .evidence import EXTRACTOR_VERSION, NORMALIZER_VERSION, sha256
+from .segmentation import _pages, chunk_verified_spans, verified_spans
 from .validation import validate_build
 from .vector import validate_vectors
 
@@ -25,9 +27,6 @@ CREATE TABLE evidence(id TEXT PRIMARY KEY,chunk_id TEXT NOT NULL REFERENCES chun
 CREATE TABLE quality_signals(paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,flags TEXT NOT NULL,score REAL NOT NULL DEFAULT 0);
 CREATE TABLE build_runs(id TEXT PRIMARY KEY,input_hash TEXT,extractor_version TEXT,normalizer_version TEXT,started_at TEXT,elapsed_ms INTEGER,counts TEXT,quarantined TEXT);
 CREATE VIRTUAL TABLE chunks_fts USING fts5(chunk_id UNINDEXED,title,text,keywords,formula_terms);'''
-
-
-def _utf16(value: str) -> int: return len(value.encode("utf-16-le")) // 2
 
 
 def _identity(config: Config, ids: list[str]) -> tuple[str, str]:
@@ -51,11 +50,6 @@ def _identity(config: Config, ids: list[str]) -> tuple[str, str]:
     return bid, ih
 
 
-def _pages(span: dict) -> list[int]:
-    page = span.get("page_range") or {}
-    return list(range(page.get("start", 1), page.get("end", page.get("start", 1)) + 1)) if page else []
-
-
 def _resumable_state(db_path, build_id, input_hash):
     """Return (counts, quarantined) for a completed ingestion of this exact build.
 
@@ -76,7 +70,7 @@ def _resumable_state(db_path, build_id, input_hash):
         return None
 
 
-def _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, started_at):
+def _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, started_at, memory_fit=None):
     if counts.get("papers", 0) <= 0 or len(quarantined) > config.max_quarantined_papers: raise ValueError("Build failed quarantine/completeness threshold")
     vector_meta = {}
     if config.embedding:
@@ -91,7 +85,7 @@ def _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, 
         db_vector_meta = {**vector_meta, "indexPath": "chroma"} if vector_meta.get("enabled") else vector_meta
         with sqlite3.connect(target) as db:
             db.execute("INSERT OR REPLACE INTO database_meta VALUES (?,?)", ("vector_search", json.dumps(db_vector_meta)))
-    report = {"complete": True, "buildId": build_id, "inputHash": input_hash, "databasePath": str(out / build_id / target.name), "alias": config.alias, "startedAt": started_at, "counts": counts, "quarantined": quarantined, "runtime": {"recipePath": str(config.recipe_path), "pythonExecutable": config.python_executable}, "vectorSearch": vector_meta or {"enabled": False}, "validation": {"valid": gate["valid"] and vector_gate["valid"], "requiredQueries": gate["requiredQueries"], "configuredRequiredQueries": config.required_queries or [], "errors": gate["errors"] + vector_gate["errors"]}}
+    report = {"complete": True, "buildId": build_id, "inputHash": input_hash, "databasePath": str(out / build_id / target.name), "alias": config.alias, "startedAt": started_at, "counts": counts, "quarantined": quarantined, "runtime": {"recipePath": str(config.recipe_path), "pythonExecutable": config.python_executable}, "chunking": config.semantic_dict()["chunking"], "memoryEstimate": memory_fit, "vectorSearch": vector_meta or {"enabled": False}, "validation": {"valid": gate["valid"] and vector_gate["valid"], "requiredQueries": gate["requiredQueries"], "configuredRequiredQueries": config.required_queries or [], "errors": gate["errors"] + vector_gate["errors"]}}
     with sqlite3.connect(target) as db:
         db.execute("INSERT OR REPLACE INTO database_meta VALUES (?,?)", ("build_report", json.dumps(report)))
     (work / "metadata.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -107,6 +101,13 @@ def build(config: Config) -> dict:
     if len(set(ids)) != len(ids) or any(not re.fullmatch(r"paper\d+", x) for x in ids): raise ValueError("Invalid paper IDs")
     for pid in ids:
         if not (root / pid).resolve().is_relative_to(root): raise ValueError("Paper path escapes corpus root")
+    if config.chunking.mode == "auto":
+        raise ValueError("chunking.mode auto is resolved by `pydb plan`; set explicit chunking values before building")
+    memory_fit = check_build_fit(config, root, ids)
+    if memory_fit.get("checked") is False and memory_fit.get("reason") != "embedding is disabled":
+        print(f"pydb: warning: memory fit was not checked: {memory_fit.get('reason')}", file=__import__("sys").stderr)
+    if memory_fit.get("overBudgetAllowed"):
+        print("pydb: warning: estimated vector index exceeds the detected memory budget; allow_over_budget is set", file=__import__("sys").stderr)
     build_id, input_hash = _identity(config, ids)
     out = config.output_dir.resolve(); out.mkdir(parents=True, exist_ok=True)
     final = out / build_id
@@ -123,7 +124,7 @@ def build(config: Config) -> dict:
     if resumed is not None:
         counts, quarantined = resumed
         print(f"pydb: resuming completed ingestion ({counts['papers']} papers, {counts['chunks']} chunks)", file=__import__("sys").stderr)
-        return _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        return _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), memory_fit)
     started = time.time(); started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()); quarantined = []; papers = chunks = 0
     with sqlite3.connect(db_path) as db:
         db.executescript(SCHEMA)
@@ -147,7 +148,7 @@ def build(config: Config) -> dict:
                     texpath = root / pid / "main.tex"
                     if texpath.exists() and not texpath.resolve(strict=True).is_relative_to((root / pid).resolve()): raise ValueError("Source file escapes paper directory")
                     original = texpath.read_text(encoding="utf-8") if texpath.exists() else ""
-                    norm, maps = normalize_latex_with_map(original); nh = sha256(norm); sh = sha256(original)
+                    spans, norm, maps = verified_spans(original, sections); nh = sha256(norm); sh = sha256(original)
                     paper = f"{config.alias}:{build_id}:{manifest['document_id']}"
                     db.execute("INSERT INTO papers VALUES (?,?,?,?,?,?,?)", (paper, build_id, manifest["document_id"], doc["doi"], doc["title"], (doc.get("article_type") or {}).get("category"), json.dumps({"paperId": pid, "schemaVersion": 4})))
                     db.execute("INSERT INTO source_texts VALUES (?,?,?,?,?,?)", (paper, original, norm, json.dumps({"originalToNormalized": maps.originalToNormalized, "normalizedToOriginal": maps.normalizedToOriginal}), sh, nh))
@@ -162,33 +163,7 @@ def build(config: Config) -> dict:
                         sid = f"{paper}:{sec['id']}"; secmap[sec["id"]] = sid
                         content = " ".join(filter(None, [sec.get("purpose"), *(sec.get("knowledge", {}).get("key_points", [])), *(c.get("statement", "") for c in sec.get("knowledge", {}).get("claims", []))]))
                         db.execute("INSERT INTO sections VALUES (?,?,?,?,?)", (sid, paper, sec.get("title", sec["id"]), json.dumps(_pages(sec)), content))
-                    snips = []
-                    headings = []
-                    heading_re = re.compile(r"\\(?:sub)*section\*?\s*\{([^{}]*)\}")
-                    used = set()
-                    tex_headings = [{"title": normalize_latex(m.group(1)), "raw": m.group(1), "offset": m.start()} for m in heading_re.finditer(original)]
-                    by_heading = {}
-                    for h in tex_headings:
-                        candidates = [s for s in sections if re.sub(r"[^\w]", "", (s.get("title") or "").lower()) == re.sub(r"[^\w]", "", h["title"].lower()) and s["id"] not in used]
-                        if len(candidates) == 1:
-                            by_heading[h["offset"]] = candidates[0]; used.add(candidates[0]["id"])
-                    unresolved = [h for h in tex_headings if h["offset"] not in by_heading]
-                    remaining = [s for s in sections if s["id"] not in used]
-                    if len(unresolved) == len(remaining):
-                        for h, sec in zip(unresolved, remaining): by_heading[h["offset"]] = sec
-                    cursor = 0
-                    for h in tex_headings:
-                        sec = by_heading.get(h["offset"])
-                        if sec:
-                            prefix = normalize_latex(original[:h["offset"]])
-                            title = normalize_latex(h["raw"]).strip()
-                            at = norm.find(title, cursor)
-                            if at >= 0: cursor = at + len(title)
-                            headings.append((_utf16(norm[:at]) if at >= 0 else _utf16(prefix), sec))
-                    for span in segment_source_text(norm):
-                        if re.match(r"^\s*%|\\\b(?:begin|end)\s*\{|equation\b", span["text"], re.I): continue
-                        sec = next((s for offset, s in reversed(headings) if offset <= span["start"]), None)
-                        snips.append({**span, "section": sec["id"] if sec else "front_matter", "title": sec.get("title", sec["id"]) if sec else "Front matter", "pages": _pages(sec) if sec else [], "trust": "verified_span", "keywords": "", "formula": ""})
+                    snips = chunk_verified_spans(spans, norm, config.chunking)
                     records = retrieval.get("records", retrieval.get("retrieval", retrieval.get("chunks", [])))
                     for item in records:
                         text = item.get("content", item.get("text", item.get("summary", "")))
@@ -224,4 +199,4 @@ def build(config: Config) -> dict:
         metadata = {"schema_version": 1, "build_id": build_id, "db_id": config.alias, "alias": config.alias, "corpus_root": str(root), "counts": counts, "extractor_version": EXTRACTOR_VERSION, "normalizer_version": NORMALIZER_VERSION, "capabilities": {"lexical": True, "structured_recipes": False, "numeric_filters": False, "route_queries": False, "embeddings": bool(config.embedding)}}
         for k,v in metadata.items(): db.execute("INSERT OR REPLACE INTO database_meta VALUES (?,?)", (k,json.dumps(v)))
         db.execute("INSERT INTO build_runs VALUES (?,?,?,?,?,?,?,?)", (build_id,input_hash,EXTRACTOR_VERSION,NORMALIZER_VERSION,time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(started)),int((time.time()-started)*1000),json.dumps(counts),json.dumps(quarantined)))
-    return _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, started_at)
+    return _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, started_at, memory_fit)

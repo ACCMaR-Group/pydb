@@ -108,6 +108,23 @@ def test_redirect_is_not_followed_or_forwarded_to_target():
         target.shutdown(); target_thread.join(); target.server_close()
 
 
+def test_expected_dimensions_validate_server_vectors():
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.dumps({"data": [{"index": 0, "embedding": [1.0, 2.0]}]}).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *args): pass
+    server, thread = serve(Handler)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/v1"
+        assert embed_texts(EmbeddingConfig(url, "mock", expected_dimensions=2), ["text"]) == [[1.0, 2.0]]
+        with pytest.raises(ValueError, match="Invalid embedding response"):
+            embed_texts(EmbeddingConfig(url, "mock", expected_dimensions=3), ["text"])
+    finally:
+        server.shutdown(); thread.join(); server.server_close()
+
+
 def test_http_error_reports_status_and_detail_without_key():
     sentinel = "PYDB_SECRET_SENTINEL_HTTP"
     class Handler(BaseHTTPRequestHandler):

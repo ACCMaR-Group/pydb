@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .builder import build
 from .config import load_config
+from .estimation import plan_estimate
 from .validation import validate_build
 
 
@@ -63,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "plan":
             config = load_config(args.recipe)
-            result = {"corpusRoot": str(config.corpus_root), "paperIds": config.paper_ids, "outputDir": str(config.output_dir), "alias": config.alias, "recipePath": str(config.recipe_path), **_preflight(config)}
+            result = {"corpusRoot": str(config.corpus_root), "paperIds": config.paper_ids, "outputDir": str(config.output_dir), "alias": config.alias, "recipePath": str(config.recipe_path), **_preflight(config), "planning": plan_estimate(config, config.corpus_root, config.paper_ids)}
             print(json.dumps(result, indent=2))
         elif args.command == "build":
             print(json.dumps(build(load_config(args.recipe)), indent=2))
