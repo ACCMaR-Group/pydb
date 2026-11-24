@@ -48,6 +48,21 @@ def test_rejects_malformed_recipe_boundaries(tmp_path, body):
         load_config(recipe)
 
 
+def test_resume_defaults_true_and_does_not_change_semantic_identity(tmp_path):
+    base = "corpus_root: corpus\noutput_dir: out\n"
+    recipe = tmp_path / "input.yaml"
+    recipe.write_text(base)
+    default = load_config(recipe)
+    assert default.resume is True
+    recipe.write_text(base + "resume: false\n")
+    disabled = load_config(recipe)
+    assert disabled.resume is False
+    assert disabled.semantic_dict() == default.semantic_dict()
+    recipe.write_text(base + "resume: 'false'\n")
+    with pytest.raises(ValueError, match="resume must be boolean"):
+        load_config(recipe)
+
+
 def test_chroma_requires_embedding(tmp_path):
     recipe = tmp_path / "input.yaml"
     recipe.write_text("corpus_root: corpus\noutput_dir: out\nchroma:\n  enabled: true\n")

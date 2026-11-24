@@ -45,6 +45,7 @@ class Config:
     recipe_path: Path
     python_executable: str
     required_queries: list[dict] = None
+    resume: bool = True
 
     def __repr__(self) -> str:
         return (f"Config(corpus_root={self.corpus_root!r}, paper_ids={self.paper_ids!r}, "
@@ -183,7 +184,7 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(raw, dict):
         raise ValueError("Recipe must be a YAML mapping")
     allowed = {"corpus_root", "paper_ids", "output_dir", "alias", "embedding", "chroma",
-               "max_quarantined_papers", "python_executable", "validation"}
+               "max_quarantined_papers", "python_executable", "validation", "resume"}
     if set(raw) - allowed:
         raise ValueError("Recipe contains unknown fields")
     if not isinstance(raw.get("corpus_root"), str) or not isinstance(raw.get("output_dir"), str):
@@ -215,6 +216,9 @@ def load_config(path: str | Path) -> Config:
     interpreter = raw.get("python_executable", sys.executable)
     if not isinstance(interpreter, str) or not interpreter:
         raise ValueError("python_executable must be a nonempty string")
+    resume = raw.get("resume", True)
+    if type(resume) is not bool:
+        raise ValueError("resume must be boolean")
     validation = raw.get("validation") or {}
     if not isinstance(validation, dict) or set(validation) - {"required_queries"}:
         raise ValueError("validation contains unsupported fields")
@@ -228,4 +232,5 @@ def load_config(path: str | Path) -> Config:
                 or ("section" in item and not isinstance(item["section"], str))):
             raise ValueError("Each required query needs query, paper_id, and optional section")
     return Config(pathval("corpus_root"), list(ids) if ids is not None else None,
-                  pathval("output_dir"), alias, embedding, chroma, quarantined, recipe, interpreter, required)
+                  pathval("output_dir"), alias, embedding, chroma, quarantined, recipe, interpreter, required,
+                  resume=resume)

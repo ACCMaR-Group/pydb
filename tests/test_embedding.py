@@ -108,6 +108,26 @@ def test_redirect_is_not_followed_or_forwarded_to_target():
         target.shutdown(); target_thread.join(); target.server_close()
 
 
+def test_http_error_reports_status_and_detail_without_key():
+    sentinel = "PYDB_SECRET_SENTINEL_HTTP"
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.dumps({"error": {"message": "Model does not support dimensions"}}).encode()
+            self.send_response(400); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *args): pass
+    server, thread = serve(Handler)
+    try:
+        cfg = EmbeddingConfig(f"http://127.0.0.1:{server.server_port}/v1", "mock", api_key=sentinel, dimensions=4096, retries=0)
+        with pytest.raises(RuntimeError) as error:
+            embed_texts(cfg, ["text"])
+        message = str(error.value)
+        assert "HTTP 400" in message and "dimensions" in message
+        assert sentinel not in message
+    finally:
+        server.shutdown(); thread.join(); server.server_close()
+
+
 @pytest.mark.parametrize("vector", [["1.0"], [True]])
 def test_rejects_non_numeric_vectors(vector):
     class Handler(BaseHTTPRequestHandler):

@@ -79,6 +79,55 @@ def test_rejected_retrieval_gate_keeps_final_absent(tmp_path):
     assert list(out.glob(".work-*/science.sqlite"))
 
 
+def test_resume_reuses_completed_ingestion(tmp_path, monkeypatch, capsys):
+    import pydb.builder as builder
+    corpus = fixture(tmp_path / "corpus", [("paper1", r"\section{Results} First evidence.", "results", "Results")])
+    cfg = config(corpus, tmp_path / "out")
+    calls = []
+    real_normalize = builder.normalize_latex_with_map
+    def counting(text):
+        calls.append(text)
+        return real_normalize(text)
+    monkeypatch.setattr(builder, "normalize_latex_with_map", counting)
+    real_validate = builder.validate_build
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("simulated interruption after ingestion")
+    monkeypatch.setattr(builder, "validate_build", interrupted)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        build(cfg)
+    assert calls
+    monkeypatch.setattr(builder, "validate_build", real_validate)
+    report = build(cfg)
+    assert report["complete"] and report["counts"]["papers"] == 1
+    assert len(calls) == 1
+    assert "resuming completed ingestion" in capsys.readouterr().err
+    with sqlite3.connect(report["databasePath"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM papers").fetchone()[0] == 1
+
+
+def test_resume_false_forces_fresh_ingestion(tmp_path, monkeypatch):
+    import pydb.builder as builder
+    from dataclasses import replace
+    corpus = fixture(tmp_path / "corpus", [("paper1", r"\section{Results} First evidence.", "results", "Results")])
+    cfg = config(corpus, tmp_path / "out")
+    calls = []
+    real_normalize = builder.normalize_latex_with_map
+    def counting(text):
+        calls.append(text)
+        return real_normalize(text)
+    monkeypatch.setattr(builder, "normalize_latex_with_map", counting)
+    real_validate = builder.validate_build
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("simulated interruption after ingestion")
+    monkeypatch.setattr(builder, "validate_build", interrupted)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        build(cfg)
+    assert len(calls) == 1
+    monkeypatch.setattr(builder, "validate_build", real_validate)
+    report = build(replace(cfg, resume=False))
+    assert report["complete"] and len(calls) == 2
+
+
 def test_bundle_symlink_cannot_escape_paper_directory(tmp_path):
     corpus = fixture(tmp_path / "corpus", [("paper1", r"\\section{Results} First evidence.", "results", "Results")])
     knowledge = corpus / "paper1" / "knowledge"

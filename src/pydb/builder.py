@@ -56,6 +56,50 @@ def _pages(span: dict) -> list[int]:
     return list(range(page.get("start", 1), page.get("end", page.get("start", 1)) + 1)) if page else []
 
 
+def _resumable_state(db_path, build_id, input_hash):
+    """Return (counts, quarantined) for a completed ingestion of this exact build.
+
+    Ingestion writes its build_runs row only after every selected paper has been
+    processed, so a matching row means the database can be reused without
+    re-ingesting. Identity covers corpus digests, extractor/normalizer versions
+    and semantic recipe settings, so partial or stale databases never match.
+    """
+    try:
+        with sqlite3.connect(db_path) as db:
+            row = db.execute("SELECT input_hash,counts,quarantined FROM build_runs WHERE id=? ORDER BY rowid DESC LIMIT 1", (build_id,)).fetchone()
+            meta = db.execute("SELECT value FROM database_meta WHERE key='build_id'").fetchone()
+        if not row or row[0] != input_hash or not meta or json.loads(meta[0]) != build_id: return None
+        counts, quarantined = json.loads(row[1]), json.loads(row[2])
+        if not isinstance(counts, dict) or counts.get("papers", 0) <= 0 or not isinstance(quarantined, list): return None
+        return counts, quarantined
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+
+
+def _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, started_at):
+    if counts.get("papers", 0) <= 0 or len(quarantined) > config.max_quarantined_papers: raise ValueError("Build failed quarantine/completeness threshold")
+    vector_meta = {}
+    if config.embedding:
+        from .vector import build_vectors
+        vector_meta = build_vectors(config, db_path, work, build_id)
+    gate = validate_build(db_path, config.required_queries)
+    if not gate["valid"]: raise ValueError("Built database validation failed")
+    vector_gate = validate_vectors(db_path, work, vector_meta) if vector_meta else {"valid": True, "errors": []}
+    if not vector_gate["valid"]: raise ValueError("Built vector artifact validation failed")
+    target = work / f"{config.alias}.sqlite"
+    if vector_meta.get("embeddingEnabled") or vector_meta.get("enabled"):
+        db_vector_meta = {**vector_meta, "indexPath": "chroma"} if vector_meta.get("enabled") else vector_meta
+        with sqlite3.connect(target) as db:
+            db.execute("INSERT OR REPLACE INTO database_meta VALUES (?,?)", ("vector_search", json.dumps(db_vector_meta)))
+    report = {"complete": True, "buildId": build_id, "inputHash": input_hash, "databasePath": str(out / build_id / target.name), "alias": config.alias, "startedAt": started_at, "counts": counts, "quarantined": quarantined, "runtime": {"recipePath": str(config.recipe_path), "pythonExecutable": config.python_executable}, "vectorSearch": vector_meta or {"enabled": False}, "validation": {"valid": gate["valid"] and vector_gate["valid"], "requiredQueries": gate["requiredQueries"], "configuredRequiredQueries": config.required_queries or [], "errors": gate["errors"] + vector_gate["errors"]}}
+    with sqlite3.connect(target) as db:
+        db.execute("INSERT OR REPLACE INTO database_meta VALUES (?,?)", ("build_report", json.dumps(report)))
+    (work / "metadata.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    os.replace(work, final)
+    shutil.rmtree(work, ignore_errors=True)
+    return report
+
+
 def build(config: Config) -> dict:
     root = config.corpus_root.resolve(strict=True)
     if not root.is_dir(): raise ValueError("Corpus root must be a directory")
@@ -74,7 +118,12 @@ def build(config: Config) -> dict:
         return report
     work = out / f".work-{build_id}"; work.mkdir(exist_ok=True)
     db_path = work / f"{config.alias}.sqlite"
-    if db_path.exists(): db_path.unlink()
+    resumed = _resumable_state(db_path, build_id, input_hash) if config.resume and db_path.exists() else None
+    if db_path.exists() and resumed is None: db_path.unlink()
+    if resumed is not None:
+        counts, quarantined = resumed
+        print(f"pydb: resuming completed ingestion ({counts['papers']} papers, {counts['chunks']} chunks)", file=__import__("sys").stderr)
+        return _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     started = time.time(); started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()); quarantined = []; papers = chunks = 0
     with sqlite3.connect(db_path) as db:
         db.executescript(SCHEMA)
@@ -175,24 +224,4 @@ def build(config: Config) -> dict:
         metadata = {"schema_version": 1, "build_id": build_id, "db_id": config.alias, "alias": config.alias, "corpus_root": str(root), "counts": counts, "extractor_version": EXTRACTOR_VERSION, "normalizer_version": NORMALIZER_VERSION, "capabilities": {"lexical": True, "structured_recipes": False, "numeric_filters": False, "route_queries": False, "embeddings": bool(config.embedding)}}
         for k,v in metadata.items(): db.execute("INSERT OR REPLACE INTO database_meta VALUES (?,?)", (k,json.dumps(v)))
         db.execute("INSERT INTO build_runs VALUES (?,?,?,?,?,?,?,?)", (build_id,input_hash,EXTRACTOR_VERSION,NORMALIZER_VERSION,time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(started)),int((time.time()-started)*1000),json.dumps(counts),json.dumps(quarantined)))
-    if papers == 0 or len(quarantined) > config.max_quarantined_papers: raise ValueError("Build failed quarantine/completeness threshold")
-    vector_meta = {}
-    if config.embedding:
-        from .vector import build_vectors
-        vector_meta = build_vectors(config, db_path, work, build_id)
-    gate = validate_build(db_path, config.required_queries)
-    if not gate["valid"]: raise ValueError("Built database validation failed")
-    vector_gate = validate_vectors(db_path, work, vector_meta) if vector_meta else {"valid": True, "errors": []}
-    if not vector_gate["valid"]: raise ValueError("Built vector artifact validation failed")
-    target = work / f"{config.alias}.sqlite"
-    if vector_meta.get("embeddingEnabled") or vector_meta.get("enabled"):
-        db_vector_meta = {**vector_meta, "indexPath": "chroma"} if vector_meta.get("enabled") else vector_meta
-        with sqlite3.connect(target) as db:
-            db.execute("INSERT OR REPLACE INTO database_meta VALUES (?,?)", ("vector_search", json.dumps(db_vector_meta)))
-    report = {"complete": True, "buildId": build_id, "inputHash": input_hash, "databasePath": str(out / build_id / target.name), "alias": config.alias, "startedAt": started_at, "counts": counts, "quarantined": quarantined, "runtime": {"recipePath": str(config.recipe_path), "pythonExecutable": config.python_executable}, "vectorSearch": vector_meta or {"enabled": False}, "validation": {"valid": gate["valid"] and vector_gate["valid"], "requiredQueries": gate["requiredQueries"], "configuredRequiredQueries": config.required_queries or [], "errors": gate["errors"] + vector_gate["errors"]}}
-    with sqlite3.connect(target) as db:
-        db.execute("INSERT OR REPLACE INTO database_meta VALUES (?,?)", ("build_report", json.dumps(report)))
-    (work / "metadata.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    os.replace(work, final)
-    shutil.rmtree(work, ignore_errors=True)
-    return report
+    return _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, started_at)

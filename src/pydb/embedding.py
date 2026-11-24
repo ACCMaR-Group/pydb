@@ -67,7 +67,12 @@ def embed_texts(config: EmbeddingConfig, texts: list[str]) -> list[list[float]]:
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
                 retryable = not isinstance(exc, urllib.error.HTTPError) or exc.code == 429 or exc.code >= 500
                 if attempt >= config.retries or not retryable:
-                    raise RuntimeError("Embedding request failed") from None
+                    if isinstance(exc, urllib.error.HTTPError):
+                        detail = ""
+                        try: detail = exc.read(300).decode("utf-8", "replace").strip().replace("\n", " ")
+                        except Exception: pass
+                        raise RuntimeError(f"Embedding request failed (HTTP {exc.code})" + (f": {detail}" if detail else "")) from None
+                    raise RuntimeError(f"Embedding request failed ({type(exc).__name__}: {exc})") from None
                 time.sleep(min(0.25 * (2 ** attempt), 2))
             except Exception:
                 raise ValueError("Invalid embedding response") from None
