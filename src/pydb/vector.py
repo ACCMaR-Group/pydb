@@ -64,8 +64,10 @@ def build_vectors(config: Config, db_path: str | Path, work_dir: str | Path, bui
             raise
         except Exception:
             collection = client.create_collection("evidence", metadata=expected, embedding_function=None)
+    existing_count = collection.count() if collection is not None else None
     with sqlite3.connect(checkpoint_path) as checkpoint:
         checkpoint.execute("CREATE TABLE IF NOT EXISTS vectors (build_id TEXT, fingerprint TEXT, chunk_id TEXT, text_hash TEXT, vector TEXT, PRIMARY KEY(build_id,fingerprint,chunk_id))")
+        checkpoint.execute("CREATE INDEX IF NOT EXISTS vectors_text_hash ON vectors(fingerprint,text_hash)")
         saved = {chunk_id: text_hash for chunk_id, text_hash in checkpoint.execute("SELECT chunk_id,text_hash FROM vectors WHERE build_id=? AND fingerprint=?", (build_id, fingerprint))}
         pending = [(chunk_id, text, text_hash) for chunk_id, text, text_hash in rows if saved.get(chunk_id) != text_hash]
         batch_ids, batch_vectors, batch_docs = [], [], []
@@ -82,9 +84,11 @@ def build_vectors(config: Config, db_path: str | Path, work_dir: str | Path, bui
             if collection is not None:
                 batch_ids.append(chunk_id); batch_vectors.append(vector); batch_docs.append(text)
                 if len(batch_ids) >= 256: flush()
-        if collection is not None:
+        if collection is not None and existing_count != len(rows):
             # Re-upsert persisted vectors so a resumed process repairs any index
-            # writes that were interrupted after their checkpoint commit.
+            # writes that were interrupted after their checkpoint commit. A
+            # complete index (count equals all eligible chunks) is left alone;
+            # validation verifies the exact id set afterwards.
             for chunk_id, text, text_hash in rows:
                 if saved.get(chunk_id) != text_hash: continue
                 row = checkpoint.execute("SELECT vector FROM vectors WHERE build_id=? AND fingerprint=? AND chunk_id=?", (build_id, fingerprint, chunk_id)).fetchone()
@@ -96,8 +100,24 @@ def build_vectors(config: Config, db_path: str | Path, work_dir: str | Path, bui
                 accept(chunk_id, text, value)
             flush()
         del saved
-        for start in range(0, len(pending), config.embedding.batch_size):
-            batch = pending[start:start + config.embedding.batch_size]
+        # Reuse vectors for identical text under the same embedding fingerprint,
+        # even from another build (for example after a segmentation fix). The
+        # vector is copied into this build's checkpoint.
+        to_embed = []
+        reused = 0
+        for chunk_id, text, text_hash in pending:
+            row = checkpoint.execute("SELECT vector FROM vectors WHERE fingerprint=? AND text_hash=? LIMIT 1", (fingerprint, text_hash)).fetchone()
+            try: value = json.loads(row[0]) if row else None
+            except Exception: value = None
+            if not _valid_vector(value, expected_dimensions):
+                to_embed.append((chunk_id, text, text_hash))
+                continue
+            accept(chunk_id, text, value)
+            checkpoint.execute("INSERT OR REPLACE INTO vectors VALUES (?,?,?,?,?)", (build_id, fingerprint, chunk_id, text_hash, row[0]))
+            reused += 1
+        checkpoint.commit()
+        for start in range(0, len(to_embed), config.embedding.batch_size):
+            batch = to_embed[start:start + config.embedding.batch_size]
             embeddings = embed_texts(config.embedding, [config.embedding.document_prefix + text for _, text, _ in batch])
             if len(embeddings) != len(batch):
                 raise ValueError("Invalid embedding batch")
@@ -109,7 +129,8 @@ def build_vectors(config: Config, db_path: str | Path, work_dir: str | Path, bui
     metadata = {"enabled": False, "embeddingEnabled": True, "protocolVersion": PROTOCOL_VERSION,
                 "buildId": build_id, "embeddingFingerprint": fingerprint,
                 "recipePath": str(config.recipe_path), "pythonExecutable": config.python_executable,
-                "checkpointPath": checkpoint_path.name}
+                "checkpointPath": checkpoint_path.name, "reusedVectors": reused,
+                "embeddedVectors": len(to_embed)}
     if config.chroma:
         metadata.update({"enabled": True, "indexPath": "chroma", "collection": "evidence"})
     return metadata

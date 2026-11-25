@@ -32,6 +32,44 @@ def test_plan_reports_chroma_dependency_without_importing_it(tmp_path, capsys, m
     assert not (tmp_path / "out").exists()
 
 
+def _publish_fixture(tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    root = tmp_path / "sciturbo"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "import-science-db.ts").write_text("", encoding="utf-8")
+    return build, root
+
+
+def test_publish_allows_long_import_and_surfaces_errors(tmp_path, monkeypatch, capsys):
+    import pydb.cli as cli
+    build, root = _publish_fixture(tmp_path)
+    monkeypatch.setattr(cli, "validate_build", lambda path: {"valid": True})
+    captured = {}
+    class Proc:
+        returncode = 0
+        stdout = "ok\n"
+        stderr = ""
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return Proc()
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    assert cli.main(["publish", str(build), "--sciturbo-root", str(root)]) == 0
+    assert captured["timeout"] == 3600
+    assert cli.main(["publish", str(build), "--sciturbo-root", str(root), "--in-place", "--root", str(tmp_path)]) == 0
+    assert "--in-place" in captured["command"] and "--root" in captured["command"]
+    assert cli.main(["publish", str(build), "--sciturbo-root", str(root), "--root", str(tmp_path)]) == 1
+    assert "--root requires --in-place" in capsys.readouterr().err
+    class Failed(Proc):
+        returncode = 1
+        stdout = ""
+        stderr = "importer exploded\n"
+    monkeypatch.setattr(cli.subprocess, "run", lambda command, **kwargs: Failed())
+    assert cli.main(["publish", str(build), "--sciturbo-root", str(root)]) == 1
+    assert "importer exploded" in capsys.readouterr().err
+
+
 def test_plan_reports_memory_and_chunking_without_writing(tmp_path, capsys):
     paper = tmp_path / "paper1"
     (paper / "knowledge").mkdir(parents=True)

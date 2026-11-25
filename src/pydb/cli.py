@@ -59,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "publish":
             p.add_argument("--sciturbo-root", required=True)
             p.add_argument("--config-home")
+            p.add_argument("--in-place", action="store_true")
+            p.add_argument("--root", action="append", default=[])
     p = sub.add_parser("query")
     args = parser.parse_args(argv)
     try:
@@ -86,15 +88,24 @@ def main(argv: list[str] | None = None) -> int:
             if not script.is_file(): raise ValueError("Sciturbo external import module not found")
             command = ["bun", str(script), str(Path(args.build).resolve())]
             if args.config_home: command.extend(["--config-home", str(Path(args.config_home).resolve())])
-            proc = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=120, check=False)
-            if proc.returncode: raise RuntimeError("Sciturbo publication failed")
+            if args.in_place:
+                command.append("--in-place")
+                for root in args.root: command.extend(["--root", str(Path(root).resolve())])
+            elif args.root:
+                raise ValueError("--root requires --in-place")
+            # Import copies the database, checkpoint, and vector index; a large
+            # build can take many minutes. Do not use a short fixed timeout.
+            proc = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=3600, check=False)
+            if proc.returncode:
+                detail = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")
+                raise RuntimeError("Sciturbo publication failed" + (f": {detail[:500]}" if detail else ""))
             print(proc.stdout)
         return 0
     except (ValueError, FileNotFoundError) as exc:
         print(f"pydb: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        print(f"pydb: command failed ({type(exc).__name__})", file=sys.stderr)
+        print(f"pydb: command failed ({type(exc).__name__}): {exc}", file=sys.stderr)
         return 1
 
 

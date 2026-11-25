@@ -7,6 +7,14 @@ import pytest
 from pydb.evidence import normalize_latex_with_map, segment_source_text
 
 
+def test_segment_keeps_abbreviation_text_and_covers_source():
+    source = "Here, we define the ratio, i.e., alpha. Next."
+    normalized, _ = normalize_latex_with_map(source)
+    spans = segment_source_text(normalized)
+    assert [span["text"] for span in spans] == ["Here, we define the ratio, i.e., alpha.", "Next."]
+    assert "".join(span["text"] for span in spans).replace(" ", "") == normalized.replace(" ", "")
+
+
 @pytest.mark.parametrize("source", [
     "😀 plain text.\n\nNext.",
     "A \\textbf{β😀} value.",

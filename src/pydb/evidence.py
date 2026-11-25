@@ -4,7 +4,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 
-NORMALIZER_VERSION = "latex-v4"
+NORMALIZER_VERSION = "latex-v5"
 EXTRACTOR_VERSION = "bundle-v4"
 
 
@@ -75,11 +75,20 @@ def segment_source_text(normalized: str) -> list[dict]:
     source = _units(normalized)
     spans = []
     lines = re.compile(r"[^\n]+(?:\n(?!\s*\n)[^\n]+)*")
-    sentences = re.compile(r"(?:[^.!?]|\.(?=\d))+(?:[.!?]+(?=\s|$)|$)")
+    # Allow a period inside a sentence when it is not followed by whitespace
+    # (i.e., "i.e.", "e.g.", decimals). Unmatched text between matches is also
+    # emitted, so no source text is ever dropped.
+    sentences = re.compile(r"(?:[^.!?]|\.(?![.!?]*(?:\s|$)))+[.!?]+(?=\s|$)|[^.!?]+$")
+    def emit(base: int, raw: str, start: int, end: int) -> None:
+        text = raw[start:end].strip()
+        if not text: return
+        at = base + start + raw[start:end].index(text)
+        spans.append({"start": at, "end": at + len(text), "text": _from_units(text)})
     for block in lines.finditer(source):
-        for item in sentences.finditer(block.group(0)):
-            text = item.group(0).strip()
-            if text:
-                start = block.start() + item.start() + item.group(0).index(text)
-                spans.append({"start": start, "end": start + len(text), "text": _from_units(text)})
+        raw, cursor = block.group(0), 0
+        for item in sentences.finditer(raw):
+            if item.start() > cursor: emit(block.start(), raw, cursor, item.start())
+            emit(block.start(), raw, item.start(), item.end())
+            cursor = item.end()
+        if cursor < len(raw): emit(block.start(), raw, cursor, len(raw))
     return spans

@@ -59,7 +59,14 @@ def validate_build(build_path: str | Path, required_queries: list[dict] | None =
         missing_evidence = db.execute("SELECT COUNT(*) FROM chunks c LEFT JOIN evidence e ON e.chunk_id=c.id WHERE e.id IS NULL").fetchone()[0]
         if evidence_mismatch or missing_evidence: errors.append("evidence_chunk_mismatch")
         counts = {"papers": db.execute("SELECT COUNT(*) FROM papers").fetchone()[0], "chunks": db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], "evidence": db.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], "fts": db.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]}
-        fts_mismatch = db.execute("SELECT COUNT(*) FROM chunks c LEFT JOIN chunks_fts f ON f.chunk_id=c.id WHERE f.chunk_id IS NULL OR f.title IS NOT c.title OR f.text IS NOT c.text OR f.keywords IS NOT c.keywords OR f.formula_terms IS NOT c.formula_terms").fetchone()[0]
+        # FTS5 chunk_id is UNINDEXED, so joining the virtual table directly is
+        # quadratic. Copy it once into an indexed temporary table.
+        db.execute("DROP TABLE IF EXISTS temp.fts_check")
+        db.execute("CREATE TEMP TABLE fts_check(chunk_id TEXT,title TEXT,text TEXT,keywords TEXT,formula_terms TEXT)")
+        db.execute("INSERT INTO temp.fts_check SELECT chunk_id,title,text,keywords,formula_terms FROM chunks_fts")
+        db.execute("CREATE INDEX temp.fts_check_chunk ON fts_check(chunk_id)")
+        fts_mismatch = db.execute("SELECT COUNT(*) FROM chunks c LEFT JOIN temp.fts_check f ON f.chunk_id=c.id WHERE f.chunk_id IS NULL OR f.title IS NOT c.title OR f.text IS NOT c.text OR f.keywords IS NOT c.keywords OR f.formula_terms IS NOT c.formula_terms").fetchone()[0]
+        db.execute("DROP TABLE temp.fts_check")
         if fts_mismatch: errors.append("fts_alignment_mismatch")
         if db.execute("SELECT COUNT(*) FROM chunks WHERE trust_level NOT IN ('verified_span','extracted_text','generated_summary')").fetchone()[0]: errors.append("unknown_trust_level")
         if run:
@@ -72,8 +79,13 @@ def validate_build(build_path: str | Path, required_queries: list[dict] | None =
         for gate in required_queries or []:
             query, wanted = gate["query"], gate["paper_id"]
             try:
-                rows = db.execute("SELECT p.metadata,c.section,c.trust_level FROM chunks_fts f JOIN chunks c ON c.id=f.chunk_id JOIN papers p ON p.id=c.paper_id WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT 100", (query,)).fetchall()
-                hits = [(section, trust) for md, section, trust in rows if json.loads(md).get("paperId") == wanted and (gate.get("section") is None or section == gate.get("section"))]
+                # Scope the smoke check to the requested paper. Ranking across the
+                # whole corpus before the LIMIT hid valid sections for common terms.
+                rows = db.execute(
+                    "SELECT c.section,c.trust_level FROM chunks_fts f JOIN chunks c ON c.id=f.chunk_id JOIN papers p ON p.id=c.paper_id "
+                    "WHERE chunks_fts MATCH ? AND json_extract(p.metadata,'$.paperId')=?",
+                    (query, wanted)).fetchall()
+                hits = [(section, trust) for section, trust in rows if gate.get("section") is None or section == gate.get("section")]
                 matched = bool(hits)
                 trust_levels = sorted({trust for _, trust in hits})
             except sqlite3.Error:

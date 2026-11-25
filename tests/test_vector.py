@@ -45,6 +45,29 @@ def test_embedding_only_creates_secret_free_checkpoint(tmp_path, monkeypatch):
     assert validate_vectors(dbpath, tmp_path / "work", metadata)["valid"]
 
 
+def test_vectors_are_reused_across_build_ids_by_text_hash(tmp_path, monkeypatch):
+    dbpath = tmp_path / "tiny.sqlite"
+    _tiny_db(dbpath)
+    emb = EmbeddingConfig("https://api.example/v1", "mock")
+    config = Config(tmp_path, None, tmp_path, "science", emb, False, 0, tmp_path / "input.yaml", "python", [])
+    import pydb.vector as vector
+    calls = []
+    def fake(c, texts):
+        calls.append(list(texts))
+        return [[1.0, 0.0] for _ in texts]
+    monkeypatch.setattr(vector, "embed_texts", fake)
+    build_vectors(config, dbpath, tmp_path / "work", "build-a")
+    assert len(calls) == 1
+    def fail(c, texts):
+        raise AssertionError("re-embedded reusable text")
+    monkeypatch.setattr(vector, "embed_texts", fail)
+    metadata = build_vectors(config, dbpath, tmp_path / "work", "build-b")
+    assert metadata["reusedVectors"] == 2 and metadata["embeddedVectors"] == 0
+    with sqlite3.connect(tmp_path / "work" / "vectors-checkpoint.sqlite") as db:
+        assert db.execute("SELECT COUNT(*) FROM vectors WHERE build_id='build-b'").fetchone()[0] == 2
+    assert validate_vectors(dbpath, tmp_path / "work", metadata)["valid"]
+
+
 def test_embedding_fingerprint_includes_expected_dimensions(tmp_path):
     from pydb.config import Config
     def config(dim):

@@ -26,7 +26,25 @@ CREATE TABLE chunks(id TEXT PRIMARY KEY,paper_id TEXT NOT NULL REFERENCES papers
 CREATE TABLE evidence(id TEXT PRIMARY KEY,chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,section TEXT,pages TEXT,trust_level TEXT NOT NULL,source_hash TEXT NOT NULL,start_offset INTEGER,end_offset INTEGER,quote TEXT);
 CREATE TABLE quality_signals(paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,flags TEXT NOT NULL,score REAL NOT NULL DEFAULT 0);
 CREATE TABLE build_runs(id TEXT PRIMARY KEY,input_hash TEXT,extractor_version TEXT,normalizer_version TEXT,started_at TEXT,elapsed_ms INTEGER,counts TEXT,quarantined TEXT);
+CREATE INDEX IF NOT EXISTS idx_chunks_paper ON chunks(paper_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_chunk ON evidence(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_paper ON evidence(paper_id);
+CREATE INDEX IF NOT EXISTS idx_sections_paper ON sections(paper_id);
 CREATE VIRTUAL TABLE chunks_fts USING fts5(chunk_id UNINDEXED,title,text,keywords,formula_terms);'''
+
+INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_chunks_paper ON chunks(paper_id)",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_chunk ON evidence(chunk_id)",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_paper ON evidence(paper_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sections_paper ON sections(paper_id)",
+)
+
+
+def _ensure_indexes(db_path) -> None:
+    """Add lookup indexes to resumed databases built before they were part of the schema."""
+    with sqlite3.connect(db_path) as db:
+        for statement in INDEX_STATEMENTS:
+            db.execute(statement)
 
 
 def _identity(config: Config, ids: list[str]) -> tuple[str, str]:
@@ -72,6 +90,7 @@ def _resumable_state(db_path, build_id, input_hash):
 
 def _finalize(config, db_path, work, build_id, input_hash, counts, quarantined, out, final, started_at, memory_fit=None):
     if counts.get("papers", 0) <= 0 or len(quarantined) > config.max_quarantined_papers: raise ValueError("Build failed quarantine/completeness threshold")
+    _ensure_indexes(db_path)
     vector_meta = {}
     if config.embedding:
         from .vector import build_vectors
